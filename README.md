@@ -4,6 +4,7 @@
 存储金字塔：
 
 ![](https://segmentfault.com/img/remote/1460000020338431)
+
 从上往下依次是：
 * CPU寄存器
 * Cache
