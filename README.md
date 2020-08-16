@@ -142,3 +142,80 @@ mheap与TCMalloc中的PageHeap类似，**它是堆内存的抽象，把从OS申�
 但mheap与PageHeap也有不同点：mheap把Span组织成了树结构，而不是链表，并且还是2棵树，然后把Span分配到heapArena进行管理，
 它包含地址映射和span是否包含指针等位图，这样做的主要原因是为了更高效的利用内存：分配、回收和再利用。
 
+#### 大小转换
+![](https://segmentfault.com/img/remote/1460000020338442)
+
+*object size*: 代码里简称size，指申请内存的大小
+
+*size class*： 代码里简称class，它是size的级别，相当于把size归类到一定大小的区间段，比如size[1,8]属于size class 1，size(8,16]属于size class 2。
+
+*span class*: 指span的级别，但span class的大小与span的大小并没有正比关系。span class主要用来和size class做对应，1个size class对应2个span class，2个span class的大小相同，只是功能不同，1个用来存放包含指针的对象，一个用来存访不包含指针的对象，不包含指针对象的span就无需GC扫描了。
+
+*num of page*：代码里进程npage，代表page的数量，其实就是span包含的页数，用来分配内存。
+
+### 3.1 Go内存分配
+Go中的内存分类并不像TCMalloc那样分成小、中、大对象，但是它的小对象里又细分了一个Tiny对象，Tiny对象指大小在1Byte到16Byte之间并且不包含指针的对象。小对象和大对象只用大小划定，无其他区分。
+
+![](https://segmentfault.com/img/remote/1460000020338446)
+
+小对象是在mcache中分配的，而大对象是直接从mheap分配的，从小对象的内存分配看起。
+
+#### 小对象分配
+![](https://segmentfault.com/img/remote/1460000020338441)
+
+大小转换这一小节，我们介绍了转换表，size+class从1到66共66个，代码中_NumSizeClasses=67代表了实际使用的size class数量，即67个，从0到67，size class 0实际并未使用到。上文提到1个size class对应2个span class。numSpanClasses为span+class的数量为134个，所以span class的下标是从0到133，所以上图中mcache标注了的span class是，span class 0到span class 133。每1个span class都指向1个span，也就是mcache最多有134个span。
+
+##### 为对象寻找span
+1. 计算对象所需内存大小size
+2. 根据size到size class的映射，计算所需的size class
+3. 根据size class和对象是否包含指针算出span class
+4. 获取该span class指向的span。
+
+##### 从span分配对象空间
+Span可以按对象大小切成很多份，这些都可以从映射表上计算出来，以size class 3对应的span为例，span大小是8KB，每个对象实际所占空间为32Byte，这个span就被分成了256块，可以根据span的起始地址计算出每个对象块的内存地址。
+
+![](https://segmentfault.com/img/remote/1460000020338447)
+
+随着内存的分配，span中的对象内存块，有些被占用，有些未被占用，比如上图，整体代表1个span，蓝色块代表已被占用内存，绿色块代表未被占用内存。
+
+当分配内存时，只要快速找到第一个可用的绿色块，并计算出内存地址即可，如果需要还可以对内存块数据清零。
+
+##### span没有空间怎么分配对象
+span内的所有内存块都被占用时，没有剩余空间继续分配对象，mcache会向mcentral申请1个span，mcache拿到span后继续分配对象。
+
+##### mcentral向mcache提供span
+mcentral和mcache一样，都是0~133这134个span class级别，但每个级别都保存了2个span list，即2个span链表：
+1. nonempty：这个链表里的span，所有span都至少有1个空闲的对象空间。这些span是mcache释放span时加入到该链表的。
+2. empty：这个链表里的span，所有的span都不确定里面是否有空闲的对象空间。当一个span交给mcache的时候，就会加入到empty链表。
+
+![](https://segmentfault.com/img/remote/1460000020338448)
+
+实际代码中每1个span+class对应1个mcentral，图里把所有mcentral抽象成1个整体了。
+
+mcache向mcentral要span时，mcentral会先从nonempty搜索满足条件的span，如果每找到再从emtpy搜索满足条件的span，然后把找到的span交给mcache。
+
+##### mheap的span管理
+mheap里保存了2棵二叉排序树，按span的page数量进行排序：
+1. free：free中保存的span是空闲的并且非垃圾回收的span。
+2. scav：scav中保存的是空闲并且已经垃圾回收的span。
+
+如果是垃圾回收导致的span释放，span会被加入到scav，否则加入到free，比如刚从OS申请的的内存也组成的Span。
+
+![](https://segmentfault.com/img/remote/1460000020338449)
+
+mheap中还有arenas，有一组heapArena组成，每一个heapArena都包含了连续的pagesPerArena个span，这个主要是为mheap管理span和垃圾回收服务。
+
+mheap本身是一个全局变量，它其中的数据，也都是从OS直接申请来的内存，并不在mheap所管理的那部分内存内。
+
+##### mcentral向mheap要span
+mcentral向mcache提供span时，如果emtpy里也没有符合条件的span，mcentral会向mheap申请span。
+
+mcentral需要向mheap提供需要的内存页数和span class级别，然后它优先从free中搜索可用的span，如果没有找到，会从scav中搜索可用的span，如果还没有找到，它会向OS申请内存，再重新搜索2棵树，必然能找到span。如果找到的span比需求的span大，则把span进行分割成2个span，其中1个刚好是需求大小，把剩下的span再加入到free中去，然后设置需求span的基本信息，然后交给mcentral。
+
+##### mheap想OS申请内存
+当mheap没有足够的内存时，mheap会向OS申请内存，把申请的内存页保存到span，然后把span插入到free树。
+
+在32位系统上，mheap还会预留一部分空间，当mheap没有空间时，先从预留空间申请，如果预留空间内存也没有了，才向OS申请。
+
+#### 大对象分配
+大对象的分配比小对象省事多了，99%的流程与mcentral向mheap申请内存的相同，所以不重复介绍了，不同的一点在于mheap会记录一点大对象的统计信息，见mheap.alloc_m()。
